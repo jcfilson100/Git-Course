@@ -48,6 +48,10 @@ def get_user_leagues(user_id: str, season: str) -> List[dict]:
     return http_get(f"/user/{user_id}/leagues/nfl/{season}") or []
 
 
+def get_league(league_id: str) -> dict:
+    return http_get(f"/league/{league_id}") or {}
+
+
 def get_league_users(league_id: str) -> List[dict]:
     return http_get(f"/league/{league_id}/users") or []
 
@@ -118,6 +122,19 @@ def resolve_draft_slot_for_user(draft_obj: dict, my_user_id: str, my_roster_id: 
                     return int(slot_str)
             except Exception:
                 continue
+    return None
+
+
+def resolve_draft_slot_for_roster(draft_obj: dict, roster_id: Optional[int]) -> Optional[int]:
+    if not draft_obj or roster_id is None:
+        return None
+    slot_to_roster = draft_obj.get("slot_to_roster_id") or {}
+    for slot_str, rid in slot_to_roster.items():
+        try:
+            if int(rid) == int(roster_id):
+                return int(slot_str)
+        except Exception:
+            continue
     return None
 
 
@@ -199,6 +216,72 @@ def build_export_rows(
     return rows
 
 
+def build_export_rows_for_league(
+    league_id: str,
+    include_names: bool,
+) -> List[Dict[str, str]]:
+    league = get_league(league_id)
+    league_name = league.get("name") or ""
+    league_season = str(league.get("season") or "")
+
+    users = get_league_users(league_id)
+    user_map = {u.get("user_id"): u for u in users}
+    rosters = get_league_rosters(league_id)
+
+    # Resolve draft
+    draft_id = league.get("draft_id")
+    draft_obj: dict = {}
+    if draft_id:
+        draft_obj = get_draft(draft_id)
+    else:
+        drafts = get_league_drafts(league_id)
+        if drafts:
+            draft_obj = get_draft(drafts[0].get("draft_id"))
+
+    players_index: Dict[str, dict] = {}
+    if include_names:
+        players_index = get_players_index()
+
+    def map_ids(ids: List[str]) -> str:
+        if not include_names:
+            return ";".join(ids or [])
+        out: List[str] = []
+        for pid in (ids or []):
+            pdata = players_index.get(str(pid))
+            out.append(map_player_id(pdata) if pdata else str(pid))
+        return ";".join(out)
+
+    rows: List[Dict[str, str]] = []
+    for r in rosters:
+        roster_id = r.get("roster_id")
+        owner_uid = r.get("owner_id")
+        starters_ids = r.get("starters") or []
+        player_ids = r.get("players") or []
+        starters_list, bench_list = partition_starters_bench(starters_ids, player_ids)
+
+        user = user_map.get(str(owner_uid)) or {}
+        owner_display = user.get("display_name") or user.get("username") or ""
+        team_name = (user.get("metadata") or {}).get("team_name") or ""
+
+        draft_slot = resolve_draft_slot_for_roster(draft_obj, roster_id)
+
+        row = {
+            "season": league_season,
+            "league_name": league_name,
+            "league_id": str(league_id),
+            "team_name": team_name,
+            "owner_display_name": owner_display,
+            "roster_id": str(roster_id or ""),
+            "draft_slot": str(draft_slot or ""),
+            "starters": map_ids(starters_list),
+            "bench": map_ids(bench_list),
+            "all_players": map_ids(player_ids),
+        }
+        rows.append(row)
+
+    return rows
+
+
 def write_csv(rows: List[Dict[str, str]], out_path: Optional[str]) -> None:
     fieldnames = [
         "season",
@@ -232,6 +315,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--username", help="Sleeper username to export for")
     g.add_argument("--user-id", help="Sleeper user_id to export for")
+    g.add_argument("--league-id", help="Sleeper league_id to export (exports all rosters)")
     parser.add_argument("--season", help="Season (e.g. 2024). Defaults to active league season.")
     parser.add_argument("--names", action="store_true", help="Include player names (calls large /players endpoint)")
     parser.add_argument("--out", help="Output CSV path. If omitted, prints to stdout.")
@@ -240,6 +324,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
 
 def main(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
+
+    if args.league_id:
+        league_id = str(args.league_id).strip().strip("/")
+        rows = build_export_rows_for_league(league_id=league_id, include_names=args.names)
+        write_csv(rows, args.out)
+        return
+
     user_id = resolve_user_id(args.username, args.user_id)
     season = args.season or get_active_league_season()
 

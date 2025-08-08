@@ -14,7 +14,7 @@ API_BASE = "https://api.sleeper.app/v1"
 
 def http_get(path: str, timeout: int = 20) -> dict:
     url = path if path.startswith("http") else f"{API_BASE}{path}"
-    req = Request(url, headers={"User-Agent": "sleeper-export-cli/1.0"})
+    req = Request(url, headers={"User-Agent": "sleeper-export-cli/1.1"})
     try:
         with urlopen(req, timeout=timeout) as resp:
             data = resp.read()
@@ -69,6 +69,13 @@ def get_draft(draft_id: str) -> dict:
     return http_get(f"/draft/{draft_id}") or {}
 
 
+def get_draft_picks(draft_id: str) -> List[dict]:
+    data = http_get(f"/draft/{draft_id}/picks")
+    if isinstance(data, list):
+        return data
+    return []
+
+
 def get_players_index() -> Dict[str, dict]:
     # Large payload (~5MB)
     return http_get("/players/nfl") or {}
@@ -86,6 +93,17 @@ def map_player_id(player: dict) -> str:
     if full and (pos or team):
         return f"{full} ({pos}-{team})".strip(" -()")
     return full or player.get("player_id") or ""
+
+
+def get_player_meta(player: Optional[dict]) -> Tuple[str, str, str]:
+    if not player:
+        return "", "", ""
+    first = player.get("first_name") or ""
+    last = player.get("last_name") or ""
+    name = (first + " " + last).strip() or player.get("full_name") or ""
+    pos = player.get("position") or ""
+    team = player.get("team") or ""
+    return name, pos, team
 
 
 def partition_starters_bench(starters: List[str], all_players: List[str]) -> Tuple[List[str], List[str]]:
@@ -282,8 +300,111 @@ def build_export_rows_for_league(
     return rows
 
 
+def build_player_rows_for_league(
+    league_id: str,
+    include_names: bool,
+) -> List[Dict[str, str]]:
+    league = get_league(league_id)
+    league_name = league.get("name") or ""
+    league_season = str(league.get("season") or "")
+
+    users = get_league_users(league_id)
+    user_map = {u.get("user_id"): u for u in users}
+    rosters = get_league_rosters(league_id)
+
+    # Draft and picks
+    draft_id = league.get("draft_id")
+    draft_obj: dict = {}
+    picks: List[dict] = []
+    if draft_id:
+        draft_obj = get_draft(draft_id)
+        picks = get_draft_picks(draft_id)
+    else:
+        drafts = get_league_drafts(league_id)
+        if drafts:
+            draft_id = drafts[0].get("draft_id")
+            draft_obj = get_draft(draft_id)
+            picks = get_draft_picks(draft_id)
+
+    # Build player_id -> pick info map
+    player_to_pick: Dict[str, dict] = {}
+    for p in picks or []:
+        pid = str(p.get("player_id")) if p.get("player_id") is not None else None
+        if not pid:
+            continue
+        player_to_pick[pid] = {
+            "round": p.get("round"),
+            "pick_no": p.get("pick_no"),
+            "draft_slot": p.get("draft_slot"),
+            "picked_by_user_id": p.get("picked_by"),
+            "picked_roster_id": p.get("roster_id"),
+            "is_keeper": p.get("is_keeper"),
+        }
+
+    players_index: Dict[str, dict] = {}
+    if include_names:
+        players_index = get_players_index()
+
+    rows: List[Dict[str, str]] = []
+
+    for r in rosters:
+        roster_id = r.get("roster_id")
+        owner_uid = r.get("owner_id")
+        user = user_map.get(str(owner_uid)) or {}
+        owner_display = user.get("display_name") or user.get("username") or ""
+        team_name = (user.get("metadata") or {}).get("team_name") or ""
+        my_slot = resolve_draft_slot_for_roster(draft_obj, roster_id)
+
+        for pid in (r.get("players") or []):
+            pid_str = str(pid)
+            pick_info = player_to_pick.get(pid_str) or {}
+            drafted_round = pick_info.get("round")
+            drafted_pick_no = pick_info.get("pick_no")
+            drafted_by_roster_id = pick_info.get("picked_roster_id")
+
+            pmeta = players_index.get(pid_str) if include_names else None
+            name, pos, nfl_team = get_player_meta(pmeta)
+
+            row = {
+                "season": league_season,
+                "league_name": league_name,
+                "league_id": str(league_id),
+                "roster_id": str(roster_id or ""),
+                "draft_slot": str(my_slot or ""),
+                "team_name": team_name,
+                "owner_display_name": owner_display,
+                "player_id": pid_str,
+                "player_name": name,
+                "position": pos,
+                "nfl_team": nfl_team,
+                "drafted_round": str(drafted_round or ""),
+                "drafted_pick_no": str(drafted_pick_no or ""),
+                "drafted_by_roster_id": str(drafted_by_roster_id or ""),
+            }
+            rows.append(row)
+
+    return rows
+
+
 def write_csv(rows: List[Dict[str, str]], out_path: Optional[str]) -> None:
-    fieldnames = [
+    # Choose fieldnames dynamically; if player rows, include player columns
+    preferred_player = [
+        "season",
+        "league_name",
+        "league_id",
+        "team_name",
+        "owner_display_name",
+        "roster_id",
+        "draft_slot",
+        "player_id",
+        "player_name",
+        "position",
+        "nfl_team",
+        "drafted_round",
+        "drafted_pick_no",
+        "drafted_by_roster_id",
+    ]
+    preferred_team = [
         "season",
         "league_name",
         "league_id",
@@ -295,6 +416,16 @@ def write_csv(rows: List[Dict[str, str]], out_path: Optional[str]) -> None:
         "bench",
         "all_players",
     ]
+
+    # Decide header set
+    any_player_rows = any("player_id" in r for r in rows)
+    if any_player_rows:
+        keys = set()
+        for r in rows:
+            keys.update(r.keys())
+        fieldnames = [k for k in preferred_player if k in keys] + [k for k in sorted(keys) if k not in preferred_player]
+    else:
+        fieldnames = preferred_team
 
     if out_path:
         os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -308,9 +439,54 @@ def write_csv(rows: List[Dict[str, str]], out_path: Optional[str]) -> None:
         writer.writerows(rows)
 
 
+def write_xlsx(rows: List[Dict[str, str]], out_path: str) -> None:
+    # Lazy import to avoid hard dependency when not needed
+    try:
+        from openpyxl import Workbook
+    except Exception as e:
+        raise SystemExit("openpyxl is required for .xlsx export. Install with: python3 -m pip install --user openpyxl")
+
+    if not rows:
+        headers: List[str] = []
+    else:
+        # Union of keys across rows, but keep a stable preferred order
+        preferred = [
+            "season",
+            "league_name",
+            "league_id",
+            "team_name",
+            "owner_display_name",
+            "roster_id",
+            "draft_slot",
+            "player_id",
+            "player_name",
+            "position",
+            "nfl_team",
+            "drafted_round",
+            "drafted_pick_no",
+            "drafted_by_roster_id",
+        ]
+        keys = set()
+        for r in rows:
+            keys.update(r.keys())
+        headers = [k for k in preferred if k in keys] + [k for k in sorted(keys) if k not in preferred]
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "players"
+
+    if headers:
+        ws.append(headers)
+        for r in rows:
+            ws.append([r.get(h, "") for h in headers])
+
+    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
+    wb.save(out_path)
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Export Sleeper leagues roster and draft position to CSV",
+        description="Export Sleeper leagues roster and draft position to CSV or Excel",
     )
     g = parser.add_mutually_exclusive_group(required=True)
     g.add_argument("--username", help="Sleeper username to export for")
@@ -318,7 +494,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     g.add_argument("--league-id", help="Sleeper league_id to export (exports all rosters)")
     parser.add_argument("--season", help="Season (e.g. 2024). Defaults to active league season.")
     parser.add_argument("--names", action="store_true", help="Include player names (calls large /players endpoint)")
-    parser.add_argument("--out", help="Output CSV path. If omitted, prints to stdout.")
+    parser.add_argument(
+        "--players",
+        action="store_true",
+        help="When used with --league-id and CSV output, writes one row per player including draft round/pick",
+    )
+    parser.add_argument("--out", help="Output path. If ends with .xlsx, writes an Excel file of players; otherwise CSV summary.")
     return parser.parse_args(argv)
 
 
@@ -327,6 +508,16 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.league_id:
         league_id = str(args.league_id).strip().strip("/")
+        # If .xlsx requested, produce per-player rows including draft round/pick
+        if args.out and args.out.lower().endswith(".xlsx"):
+            rows = build_player_rows_for_league(league_id=league_id, include_names=args.names)
+            write_xlsx(rows, args.out)
+            return
+        # For CSV: if --players, output per-player rows; else team summary
+        if args.players:
+            rows = build_player_rows_for_league(league_id=league_id, include_names=args.names)
+            write_csv(rows, args.out)
+            return
         rows = build_export_rows_for_league(league_id=league_id, include_names=args.names)
         write_csv(rows, args.out)
         return
